@@ -1,0 +1,78 @@
+version: 2.1
+
+jobs:
+  create_and_deploy_front_end:
+    docker:
+        - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run:
+          name: "Deploy AWS infrastructure"
+          command: |
+            aws cloudformation deploy \
+            --stack-name "${CIRCLE_WORKFLOW_ID}" \
+            --template-file bucket.yml \
+            --parameter-overrides NAME="${CIRCLE_WORKFLOW_ID}"
+      - run: aws s3 sync . s3://"${CIRCLE_WORKFLOW_ID}" --delete
+      - run:
+          name: Destroy environment
+          command: |
+            aws cloudformation delete-stack --stack-name "${CIRCLE_WORKFLOW_ID}""
+          when: on_fail
+
+  promote_to_production:
+    docker:
+        - image: amazon/aws-cli
+    steps:
+      - checkout
+      - run:
+          name: "Promote to production"
+          command: |
+            aws cloudformation deploy \
+            --template-file cloudfront.yml \
+            --stack-name production-distro \
+            --parameter-overrides PipelineID="${CIRCLE_WORKFLOW_ID}"
+
+  get_last_deployment_id:
+    docker:
+        - image: cibuilds/aws:1.16.1
+    steps:
+      - checkout
+      - run:
+          name: "Get last deployment ID"
+          command: |
+            aws cloudformation list-exports \
+            --query "Exports[?Name==\`PipelineID\`].Value" \
+            --no-paginate --output text > ~/output.txt
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - output.txt
+
+  clean_up_old_front_end:
+    docker:
+        - image: cibuilds/aws:1.16.1
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Clean up old environment
+          command: |
+            PreviousPipelineID=$(cat ~/output.txt)
+            aws s3 rm "s3://${PreviousPipelineID}" --recursive
+            aws cloudformation delete-stack --stack-name "${PreviousPipelineID}"
+
+workflows:
+  promotie_environment:
+    jobs:
+      - create_and_deploy_front_end
+      - get_last_deployment_id:
+          requires:
+            - create_and_deploy_front_end
+      - promote_to_production:
+          requires:
+            - create_and_deploy_front_end
+      - clean_up_old_front_end:
+          requires:
+            - get_last_deployment_id
